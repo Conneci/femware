@@ -22,7 +22,7 @@ import json, os, re
 from datetime import datetime
 
 # ── config ──────────────────────────────────────────────────────────────
-BOT_TOKEN    = "MTU1ODk4NzAyNjQ1MDA5MjA0Mg.GWXoOq.YZHSBAQ-6nnfqjck8fZ3H8UzSvNvy3q9uoCBLU"
+BOT_TOKEN    = "MTU1ODk4NzAyNjQ1MDA5MjA0Mg.Gc4y-7.NhCqSF5Ec9xtUWYNJ1_McxRTm3tnFgQrjgE85E"
 ADMIN_IDS    = [1488535363655045373]               # your Discord user ID
 SCRIPT_LINK  = "https://yourlink.com"   # script download link
 SHOP_LINK    = "https://femware.vercel.app"
@@ -347,4 +347,4 @@ async def revokekey(interaction: discord.Interaction, key: str):
     save_keys(keys)
     await interaction.response.send_message(f"✅ Key `{key}` revoked.", ephemeral=True)
   
-bot.run("MTU1ODk4NzAyNjQ1MDA5MjA0Mg.GWXoOq.YZHSBAQ-6nnfqjck8fZ3H8UzSvNvy3q9uoCBLU")
+bot.run("MTU1ODk4NzAyNjQ1MDA5MjA0Mg.Gc4y-7.NhCqSF5Ec9xtUWYNJ1_McxRTm3tnFgQrjgE85E")
