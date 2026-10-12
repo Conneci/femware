@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 # ── config ───────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "MTU1ODk4NzAyNjQ1MDA5MjA0Mg.G7jHLK.41jNx-UTZptuv3wyi_oXljzWZNwUm6iDD4PaUQ")
 API_SECRET    = os.environ.get("API_SECRET", "CHANGE_ME_32_CHARS_MIN")
-API_PORT      = int(os.environ.get("API_PORT", "8080"))
+API_PORT      = int(os.environ.get("PORT", os.environ.get("API_PORT", "8080")))
 SITE_ORIGIN   = "https://conneci.github.io"      # FILL: твой домен сайта
 SCRIPT_LINK   = "https://yourlink.com"           # FILL: ссылка на скрипт
 FUNPAY_LINK   = "https://funpay.com/"            # FILL: ссылка на лот FunPay
