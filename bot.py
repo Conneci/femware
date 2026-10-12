@@ -380,4 +380,73 @@ async def on_ready():
         await ch.send(embed=panel_embed(), view=FemWarePanel())
         print(f"[FemWare] panel sent to #{PANEL_CHANNEL} in {guild.name}")
 
+
+# ── prefix commands (!addkey, !revokekey, !checkkey) ─────────────────────
+@bot.command(name='addkey')
+async def cmd_addkey(ctx, key: str = '', *, duration: str = 'Lifetime'):
+    if ctx.author.id not in ADMIN_IDS:
+        return await ctx.reply('❌ Admins only.', delete_after=5)
+    key = key.strip().upper()
+    if not KEY_RE.match(key):
+        return await ctx.reply('❌ Format: ', delete_after=8)
+    async with KEY_LOCK:
+        keys = load_keys()
+        if key in keys:
+            return await ctx.reply(f'❌ Key  already exists.', delete_after=8)
+        keys[key] = {
+            'status': 'active', 'product': 'FemWare — Script', 'duration': duration,
+            'created': ts(), 'provider': 'manual', 'used_by': None, 'used_id': None, 'used_at': None
+        }
+        save_keys(keys)
+    await ctx.reply(f'✅ Key  added ({duration}).', delete_after=15)
+
+@bot.command(name='revokekey')
+async def cmd_revokekey(ctx, key: str = ''):
+    if ctx.author.id not in ADMIN_IDS:
+        return await ctx.reply('❌ Admins only.', delete_after=5)
+    key = key.strip().upper()
+    async with KEY_LOCK:
+        keys = load_keys()
+        if key not in keys:
+            return await ctx.reply('❌ Key not found.', delete_after=8)
+        keys[key]['status'] = 'revoked'
+        save_keys(keys)
+    await ctx.reply(f'✅ Key  revoked.', delete_after=15)
+
+@bot.command(name='checkkey')
+async def cmd_checkkey(ctx, key: str = ''):
+    if ctx.author.id not in ADMIN_IDS:
+        return await ctx.reply('❌ Admins only.', delete_after=5)
+    key = key.strip().upper()
+    keys = load_keys()
+    if key not in keys:
+        return await ctx.reply(f'❌ Key  not found.', delete_after=8)
+    e = keys[key]
+    st = e.get('status', '?')
+    color = C_OK if st == 'active' else C_ERR
+    embed = discord.Embed(title=f'Key — {key}', color=color)
+    embed.add_field(name='Status',   value=f'`{st}`',              inline=True)
+    embed.add_field(name='Duration', value=e.get('duration', '—'),   inline=True)
+    embed.add_field(name='Created',  value=e.get('created', '—'),    inline=True)
+    embed.add_field(name='Used by',  value=e.get('used_by') or '—',  inline=True)
+    embed.add_field(name='Used at',  value=e.get('used_at') or '—',  inline=True)
+    await ctx.reply(embed=embed, delete_after=30)
+
+@bot.command(name='listkeys')
+async def cmd_listkeys(ctx):
+    if ctx.author.id not in ADMIN_IDS:
+        return await ctx.reply('❌ Admins only.', delete_after=5)
+    keys = load_keys()
+    active  = [k for k,v in keys.items() if v.get('status') == 'active']
+    used    = [k for k,v in keys.items() if v.get('status') == 'used']
+    revoked = [k for k,v in keys.items() if v.get('status') == 'revoked']
+    embed = discord.Embed(title='Keys overview', color=C_ACCENT)
+    embed.add_field(name='🟢 Active',  value=str(len(active)),  inline=True)
+    embed.add_field(name='🔴 Used',    value=str(len(used)),    inline=True)
+    embed.add_field(name='⚫ Revoked', value=str(len(revoked)), inline=True)
+    if active:
+        embed.add_field(name='Active keys', value='
+'.join(f'`{k}`' for k in active[:10]), inline=False)
+    await ctx.reply(embed=embed, delete_after=60)
+
 bot.run(BOT_TOKEN)
