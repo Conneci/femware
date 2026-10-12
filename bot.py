@@ -25,7 +25,7 @@ from datetime import datetime
 BOT_TOKEN    = "MTU1ODk4NzAyNjQ1MDA5MjA0Mg.Gc4y-7.NhCqSF5Ec9xtUWYNJ1_McxRTm3tnFgQrjgE85E"
 ADMIN_IDS    = [1488535363655045373]               # your Discord user ID
 SCRIPT_LINK  = "https://yourlink.com"   # script download link
-SHOP_LINK    = "https://femware.vercel.app"
+SHOP_LINK    = "https://conneci.github.io/femwaresite/"
 BUYER_ROLE   = "Buyer"                  # exact role name in your server
 KEYS_FILE    = "keys.json"
 HWID_FILE    = "hwids.json"
