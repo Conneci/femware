@@ -184,7 +184,7 @@ class FemWarePanel(ui.View):
     async def redeem(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(RedeemModal())
 
-    @ui.button(label="Get Key", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id="fw_getkey")
+    @ui.button(label="Shop", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id="fw_getkey")
     async def getkey(self, interaction: discord.Interaction, button: ui.Button):
         e = emb(
             "🛒 Купить FemWare",
