@@ -1,138 +1,184 @@
 """
-FemWare Discord Bot — button UI
-Commands:
-  /panel  — sends the main button panel (admin only, use in a channel)
-  /addkey — admin: add a key manually
+FemWare Discord Bot
+- кнопки в #get-keys: Redeem Key / Get Key / Reset HWID / Get Role
+- REST API для сайта: POST /api/admin/keys  — генерация ключей
+                      GET  /api/admin/keys  — список всех ключей
+                      POST /api/admin/revoke — отозвать ключ
 
-Buttons:
-  🔑 Redeem Key  — user enters key, gets script link, key marked used
-  🛒 Get Key     — sends link to the shop
-  🔄 Reset HWID  — resets HWID for user (stub — wire to your loader)
-  👤 Get Role    — gives @Buyer role if user has a valid redeemed key
+Ключ активен один раз: сайт создаёт со статусом "active",
+бот меняет на "used" — повторный редим заблокирован на уровне asyncio.Lock.
 
-Setup:
-  pip install discord.py
-  python femware_bot.py
+Запуск:
+  pip install -U discord.py aiohttp
+  BOT_TOKEN=... API_SECRET=... python bot.py
 """
 
 import discord
 from discord.ext import commands
-from discord import app_commands, ui
-import json, os, re
-from datetime import datetime
+from discord import ui
+from aiohttp import web
+import asyncio, hmac, json, os, re, secrets, string, time
+from datetime import datetime, timedelta
 
-# ── config ──────────────────────────────────────────────────────────────
-BOT_TOKEN    = "MTU1ODk4NzAyNjQ1MDA5MjA0Mg.Gc4y-7.NhCqSF5Ec9xtUWYNJ1_McxRTm3tnFgQrjgE85E"
-ADMIN_IDS    = [1488535363655045373]               # your Discord user ID
-SCRIPT_LINK  = "https://yourlink.com"   # script download link
-SHOP_LINK    = "https://conneci.github.io/femwaresite/"
-BUYER_ROLE   = "Buyer"                  # exact role name in your server
-KEYS_FILE    = "keys.json"
-HWID_FILE    = "hwids.json"
-# ────────────────────────────────────────────────────────────────────────
+# ── config ───────────────────────────────────────────────────────────────
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "MTU1ODk4NzAyNjQ1MDA5MjA0Mg.G7jHLK.41jNx-UTZptuv3wyi_oXljzWZNwUm6iDD4PaUQ")
+API_SECRET    = os.environ.get("API_SECRET", "CHANGE_ME_32_CHARS_MIN")
+API_PORT      = int(os.environ.get("API_PORT", "8080"))
+SITE_ORIGIN   = "https://conneci.github.io"      # FILL: твой домен сайта
+SCRIPT_LINK   = "https://yourlink.com"           # FILL: ссылка на скрипт
+FUNPAY_LINK   = "https://funpay.com/"            # FILL: ссылка на лот FunPay
+BUYER_ROLE    = "Buyer"
+PANEL_CHANNEL = "get-keys"
+KEYS_FILE     = "keys.json"
+HWID_FILE     = "hwids.json"
+# ─────────────────────────────────────────────────────────────────────────
 
-KEY_RE = re.compile(r'^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$')
+KEY_RE   = re.compile(r'^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$')
+KEY_LOCK = asyncio.Lock()
 
-def load_keys():
-    if not os.path.exists(KEYS_FILE): return {}
-    with open(KEYS_FILE) as f: return json.load(f)
+C_OK, C_ERR, C_ACCENT, C_NEUTRAL, C_WARN = 0x00dc82, 0xff3b6b, 0xb84aff, 0x1e1e2e, 0xffb400
 
-def save_keys(data):
-    with open(KEYS_FILE, "w") as f: json.dump(data, f, indent=2)
+# ── storage ───────────────────────────────────────────────────────────────
+def _load(path):
+    if not os.path.exists(path): return {}
+    with open(path, encoding="utf-8") as f: return json.load(f)
 
-def load_hwids():
-    if not os.path.exists(HWID_FILE): return {}
-    with open(HWID_FILE) as f: return json.load(f)
+def _save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
-def save_hwids(data):
-    with open(HWID_FILE, "w") as f: json.dump(data, f, indent=2)
+def load_keys():   return _load(KEYS_FILE)
+def save_keys(d):  _save(KEYS_FILE, d)
+def load_hwids():  return _load(HWID_FILE)
+def save_hwids(d): _save(HWID_FILE, d)
+def ts():          return datetime.utcnow().strftime("%d/%m/%Y %H:%M UTC")
+def emb(t, d, c):  return discord.Embed(title=t, description=d, color=c)
 
-def ts(): return datetime.utcnow().strftime("%d/%m/%Y %H:%M UTC")
+def gen_key():
+    a = string.ascii_uppercase + string.digits
+    return "-".join("".join(secrets.choice(a) for _ in range(4)) for _ in range(4))
 
-# ── color palette ────────────────────────────────────────────────────────
-C_OK      = 0x00dc82
-C_ERR     = 0xff3b6b
-C_ACCENT  = 0xb84aff
-C_NEUTRAL = 0x1e1e2e
+def has_redeemed(uid: str) -> bool:
+    return any(
+        v.get("used_id") == uid and v.get("status") == "used"
+        for v in load_keys().values()
+    )
 
-# ── modals ───────────────────────────────────────────────────────────────
+# ── redeem core (race-safe, one-time) ────────────────────────────────────
+async def redeem_key(raw: str, user: discord.abc.User):
+    """Returns (code, entry). code: ok | format | missing | used | mine | revoked | bad"""
+    key = raw.strip().upper()
+    if not KEY_RE.match(key):
+        return "format", None
+    async with KEY_LOCK:
+        keys = load_keys()
+        entry = keys.get(key)
+        if entry is None:
+            return "missing", None
+        st = entry.get("status", "active")
+        if st == "revoked":
+            return "revoked", entry
+        if st == "used":
+            return ("mine" if entry.get("used_id") == str(user.id) else "used"), entry
+        if st != "active":
+            return "bad", entry
+        entry.update(
+            status="used",
+            used_by=str(user),
+            used_id=str(user.id),
+            used_at=ts()
+        )
+        save_keys(keys)
+        return "ok", entry
+
+# ── redeem modal ──────────────────────────────────────────────────────────
 class RedeemModal(ui.Modal, title="Redeem your FemWare key"):
     key_input = ui.TextInput(
         label="Your Key",
         placeholder="XXXX-XXXX-XXXX-XXXX",
-        min_length=19, max_length=19,
-        style=discord.TextStyle.short
+        min_length=19, max_length=19
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        code, entry = await redeem_key(self.key_input.value, interaction.user)
         key = self.key_input.value.strip().upper()
 
-        if not KEY_RE.match(key):
-            embed = discord.Embed(title="❌ Invalid format",
-                description="Key must be `XXXX-XXXX-XXXX-XXXX`.", color=C_ERR)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        if code == "format":
+            e = emb("❌ Неверный формат",
+                    "Ключ должен выглядеть так: `XXXX-XXXX-XXXX-XXXX`.\n"
+                    "Проверь, правильно ли скопировал.", C_ERR)
 
-        keys = load_keys()
+        elif code == "missing":
+            e = emb("❌ Ключ не найден",
+                    "Такого ключа нет в системе.\n\n"
+                    "Скопируй ключ из чата заказа на FunPay и попробуй снова.", C_ERR)
 
-        if key not in keys:
-            embed = discord.Embed(title="❌ Key not found",
-                description="This key doesn't exist. Check your profile on the site.", color=C_ERR)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        elif code == "revoked":
+            e = emb("❌ Ключ отозван",
+                    "Этот ключ был деактивирован. Обратись в поддержку.", C_ERR)
 
-        entry = keys[key]
+        elif code == "mine":
+            e = emb("ℹ️ Ты уже активировал этот ключ",
+                    f"Активирован **{entry.get('used_at')}**.\n\n"
+                    f"Нажми **Get Role** чтобы получить @{BUYER_ROLE}.\n"
+                    f"Нажми **Reset HWID** если сменил железо.", C_WARN)
 
-        if entry["status"] == "used":
-            embed = discord.Embed(title="❌ Already used",
-                description=f"This key was already redeemed by `{entry.get('used_by','unknown')}`.\nContact support if this is an error.",
-                color=C_ERR)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        elif code == "used":
+            e = emb("❌ Ключ уже использован",
+                    f"Этот ключ активировал `{entry.get('used_by')}` — **{entry.get('used_at')}**.\n\n"
+                    "Если считаешь, что это ошибка — обратись в поддержку.", C_ERR)
 
-        if entry["status"] == "revoked":
-            embed = discord.Embed(title="❌ Key revoked",
-                description="This key has been revoked. Contact support.", color=C_ERR)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        elif code == "bad":
+            e = emb("❌ Ключ недействителен",
+                    f"Статус ключа: `{entry.get('status')}`. Обратись в поддержку.", C_ERR)
 
-        # ✅ mark used
-        keys[key]["status"]  = "used"
-        keys[key]["used_by"] = str(interaction.user)
-        keys[key]["used_id"] = str(interaction.user.id)
-        keys[key]["used_at"] = ts()
-        save_keys(keys)
+        else:  # ok
+            e = emb("✅ Ключ принят — FemWare",
+                    f"Добро пожаловать, {interaction.user.mention}!\n\n"
+                    f"**Продукт:** {entry.get('product', 'FemWare — Script')}\n"
+                    f"**Срок:** {entry.get('duration', 'Lifetime')}\n\n"
+                    f"**Твой скрипт:**\n> [Скачать здесь]({SCRIPT_LINK})\n\n"
+                    f"⚠️ Не делись ссылкой — ключ привязан к твоему аккаунту.\n"
+                    f"Нажми **Get Role** чтобы получить @{BUYER_ROLE}.", C_OK)
+            e.set_footer(text="FemWare • поддержка в #support")
 
-        embed = discord.Embed(
-            title="✅ Key Redeemed — FemWare",
-            description=(
-                f"Welcome, **{interaction.user.mention}**!\n\n"
-                f"**Product:** {entry.get('product','FemWare — Script')}\n"
-                f"**Duration:** {entry.get('duration','Lifetime')}\n\n"
-                f"**Your script:**\n> [Download here]({SCRIPT_LINK})\n\n"
-                f"⚠️ Do **not** share this link — key is now locked to your account.\n"
-                f"Use the **Get Role** button below to receive your @{BUYER_ROLE} role."
-            ),
-            color=C_OK
-        )
-        embed.set_footer(text="FemWare • support in #support")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=e, ephemeral=True)
 
-        # log
-        log_ch = discord.utils.get(interaction.guild.text_channels, name="key-logs")
-        if log_ch:
-            log = discord.Embed(
-                title="Key redeemed",
-                description=f"**User:** {interaction.user} (`{interaction.user.id}`)\n**Key:** ||{key}||\n**Product:** {entry.get('product','FemWare')}",
-                color=C_ACCENT, timestamp=datetime.utcnow()
-            )
-            await log_ch.send(embed=log)
+        if code == "ok" and interaction.guild:
+            ch = discord.utils.get(interaction.guild.text_channels, name="key-logs")
+            if ch:
+                await ch.send(embed=discord.Embed(
+                    title="🔑 Ключ активирован",
+                    description=(
+                        f"**Пользователь:** {interaction.user} (`{interaction.user.id}`)\n"
+                        f"**Ключ:** ||{key}||\n"
+                        f"**Продукт:** {entry.get('product', 'FemWare')}\n"
+                        f"**Срок:** {entry.get('duration', 'Lifetime')}"
+                    ),
+                    color=C_ACCENT,
+                    timestamp=datetime.utcnow()
+                ))
 
+# ── panel ─────────────────────────────────────────────────────────────────
+def panel_embed():
+    e = discord.Embed(
+        title="FemWare",
+        description=(
+            "**Скрипты для Project Delta.**\n"
+            "Стабильно, мощно, актуально после каждого патча.\n\n"
+            "🔑 **Redeem Key** — ввести ключ и получить скрипт\n"
+            "🛒 **Get Key** — купить на FunPay, ключ придёт в чате заказа\n"
+            "🔄 **Reset HWID** — сбросить железо (раз в 7 дней)\n"
+            "👤 **Get Role** — получить роль @Buyer после активации"
+        ),
+        color=C_ACCENT
+    )
+    e.set_footer(text="FemWare")
+    return e
 
-# ── main panel view ──────────────────────────────────────────────────────
 class FemWarePanel(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # persistent
+    def __init__(self): super().__init__(timeout=None)
 
     @ui.button(label="Redeem Key", emoji="🔑", style=discord.ButtonStyle.primary, custom_id="fw_redeem")
     async def redeem(self, interaction: discord.Interaction, button: ui.Button):
@@ -140,211 +186,197 @@ class FemWarePanel(ui.View):
 
     @ui.button(label="Get Key", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id="fw_getkey")
     async def getkey(self, interaction: discord.Interaction, button: ui.Button):
-        embed = discord.Embed(
-            title="🛒 Get FemWare",
-            description=(
-                f"Purchase FemWare Script for **$3.00 (Lifetime)**\n\n"
-                f"[**→ Go to shop**]({SHOP_LINK})\n\n"
-                f"After purchase, your key appears in your profile on the site.\n"
-                f"Come back here and press **Redeem Key**."
-            ),
-            color=C_ACCENT
+        e = emb(
+            "🛒 Купить FemWare",
+            f"[**→ Наш лот на FunPay**]({FUNPAY_LINK})\n\n"
+            "1. Купи лот на FunPay\n"
+            "2. Ключ придёт прямо в чате заказа FunPay\n"
+            "3. Вернись сюда и нажми **Redeem Key**\n"
+            "4. Нажми **Get Role** чтобы открыть каналы для покупателей",
+            C_ACCENT
         )
-        embed.set_footer(text="FemWare • Project Delta Script")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=e, ephemeral=True)
 
     @ui.button(label="Reset HWID", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="fw_hwid")
     async def reset_hwid(self, interaction: discord.Interaction, button: ui.Button):
-        keys   = load_keys()
-        uid    = str(interaction.user.id)
-
-        # check if user has a valid redeemed key
-        has_key = any(
-            v.get("used_id") == uid and v.get("status") == "used"
-            for v in keys.values()
-        )
-        if not has_key:
-            embed = discord.Embed(
-                title="❌ No active license",
-                description="You need a redeemed key to reset HWID.",
-                color=C_ERR
+        uid = str(interaction.user.id)
+        if not has_redeemed(uid):
+            return await interaction.response.send_message(
+                embed=emb("❌ Нет активной лицензии", "Сначала активируй ключ.", C_ERR),
+                ephemeral=True
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
         hwids = load_hwids()
-        last  = hwids.get(uid, {}).get("last_reset")
-
-        # 1 reset per 7 days
+        last = hwids.get(uid, {}).get("last_reset")
         if last:
-            from datetime import timedelta
-            last_dt = datetime.strptime(last, "%d/%m/%Y %H:%M UTC")
-            if datetime.utcnow() - last_dt < timedelta(days=7):
-                remaining = timedelta(days=7) - (datetime.utcnow() - last_dt)
-                h, m = divmod(int(remaining.total_seconds()) // 60, 60)
-                d    = remaining.days
-                embed = discord.Embed(
-                    title="⏳ Reset cooldown",
-                    description=f"You can reset HWID again in **{d}d {h}h {m}m**.",
-                    color=C_ERR
+            passed = datetime.utcnow() - datetime.strptime(last, "%d/%m/%Y %H:%M UTC")
+            if passed < timedelta(days=7):
+                left = timedelta(days=7) - passed
+                h, m = divmod(left.seconds // 60, 60)
+                return await interaction.response.send_message(
+                    embed=emb("⏳ Кулдаун", f"Следующий сброс через **{left.days}д {h}ч {m}м**.", C_WARN),
+                    ephemeral=True
                 )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
-
         hwids[uid] = {"last_reset": ts(), "user": str(interaction.user)}
         save_hwids(hwids)
-
-        embed = discord.Embed(
-            title="🔄 HWID Reset",
-            description=(
-                "Your HWID has been reset successfully.\n"
-                "Restart the loader and it will register your new hardware.\n\n"
-                f"*Next reset available in 7 days.*"
-            ),
-            color=C_OK
+        await interaction.response.send_message(
+            embed=emb("🔄 HWID сброшен",
+                      "Готово. Перезапусти лоадер чтобы зарегистрировать новое железо.\n"
+                      "*Следующий сброс через 7 дней.*", C_OK),
+            ephemeral=True
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        ch = discord.utils.get(interaction.guild.text_channels, name="key-logs")
+        if ch:
+            await ch.send(embed=discord.Embed(
+                title="🔄 HWID сброшен",
+                description=f"**Пользователь:** {interaction.user} (`{interaction.user.id}`)",
+                color=C_NEUTRAL,
+                timestamp=datetime.utcnow()
+            ))
 
     @ui.button(label="Get Role", emoji="👤", style=discord.ButtonStyle.success, custom_id="fw_role")
     async def get_role(self, interaction: discord.Interaction, button: ui.Button):
-        keys = load_keys()
-        uid  = str(interaction.user.id)
-
-        has_key = any(
-            v.get("used_id") == uid and v.get("status") == "used"
-            for v in keys.values()
-        )
-        if not has_key:
-            embed = discord.Embed(
-                title="❌ No active license",
-                description="Redeem your key first, then press **Get Role**.",
-                color=C_ERR
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        role = discord.utils.get(interaction.guild.roles, name=BUYER_ROLE)
-        if not role:
-            await interaction.response.send_message(
-                f"❌ Role `{BUYER_ROLE}` not found on this server. Ask an admin to create it.",
+        if not has_redeemed(str(interaction.user.id)):
+            return await interaction.response.send_message(
+                embed=emb("❌ Нет активной лицензии",
+                          "Сначала активируй ключ через **Redeem Key**, потом жми **Get Role**.", C_ERR),
                 ephemeral=True
             )
-            return
-
-        if role in interaction.user.roles:
-            embed = discord.Embed(
-                title="✅ Already a Buyer",
-                description=f"You already have the **@{BUYER_ROLE}** role.",
-                color=C_OK
+        role = discord.utils.get(interaction.guild.roles, name=BUYER_ROLE)
+        if not role:
+            return await interaction.response.send_message(
+                f"❌ Роль `{BUYER_ROLE}` не найдена на сервере. Попроси админа создать её.",
+                ephemeral=True
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
+        if role in interaction.user.roles:
+            return await interaction.response.send_message(
+                embed=emb("✅ Уже есть роль", f"У тебя уже есть **@{BUYER_ROLE}**.", C_OK),
+                ephemeral=True
+            )
         await interaction.user.add_roles(role, reason="FemWare key redeemed")
-        embed = discord.Embed(
-            title="✅ Role granted",
-            description=f"You've been given the **@{BUYER_ROLE}** role!\nYou now have access to all buyer channels.",
-            color=C_OK
+        await interaction.response.send_message(
+            embed=emb("✅ Роль выдана",
+                      f"Ты получил **@{BUYER_ROLE}**. Каналы для покупателей теперь открыты.", C_OK),
+            ephemeral=True
         )
-        embed.set_footer(text="FemWare • thank you for your purchase")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# ── admin API (вызывается с сайта) ────────────────────────────────────────
+_FAILS: dict = {}
 
-# ── bot setup ────────────────────────────────────────────────────────────
+def check_auth(request: web.Request):
+    ip = request.headers.get("CF-Connecting-IP") or request.remote or "?"
+    n, t = _FAILS.get(ip, (0, 0))
+    if n and time.time() - t > 900: n = 0
+    if n >= 5:
+        raise web.HTTPTooManyRequests(text="too many failed attempts, try in 15min")
+    if not hmac.compare_digest(request.headers.get("X-Api-Secret", ""), API_SECRET):
+        _FAILS[ip] = (n + 1, time.time())
+        raise web.HTTPUnauthorized(text="bad secret")
+    _FAILS.pop(ip, None)
+
+async def body_json(request: web.Request):
+    try: return await request.json()
+    except Exception: raise web.HTTPBadRequest(text="bad json")
+
+async def api_gen(request: web.Request):
+    """POST /api/admin/keys {"count": 1-200, "duration": "Lifetime"} → {"keys": [...]}"""
+    check_auth(request)
+    b = await body_json(request)
+    try: count = max(1, min(int(b.get("count", 1)), 200))
+    except (TypeError, ValueError): raise web.HTTPBadRequest(text="count must be int")
+    duration = str(b.get("duration", "Lifetime"))[:32]
+    new = []
+    async with KEY_LOCK:
+        keys = load_keys()
+        attempts = 0
+        while len(new) < count:
+            k = gen_key()
+            if k in keys:
+                attempts += 1
+                if attempts > 10_000: break   # keyspace collision guard
+                continue
+            keys[k] = {
+                "status":   "active",
+                "product":  "FemWare — Script",
+                "duration": duration,
+                "created":  ts(),
+                "provider": "site",
+                "used_by":  None,
+                "used_id":  None,
+                "used_at":  None,
+            }
+            new.append(k)
+        save_keys(keys)
+    return web.json_response({"keys": new})
+
+async def api_list(request: web.Request):
+    """GET /api/admin/keys → {"keys": {key: entry}}"""
+    check_auth(request)
+    return web.json_response({"keys": load_keys()})
+
+async def api_revoke(request: web.Request):
+    """POST /api/admin/revoke {"key": "XXXX-XXXX-XXXX-XXXX"} → {"key": ..., "status": "revoked"}"""
+    check_auth(request)
+    key = str((await body_json(request)).get("key", "")).strip().upper()
+    async with KEY_LOCK:
+        keys = load_keys()
+        if key not in keys:
+            raise web.HTTPNotFound(text="key not found")
+        keys[key]["status"] = "revoked"
+        save_keys(keys)
+    return web.json_response({"key": key, "status": "revoked"})
+
+@web.middleware
+async def cors(request: web.Request, handler):
+    try:
+        resp = web.Response() if request.method == "OPTIONS" else await handler(request)
+    except web.HTTPException as e:
+        resp = e
+    resp.headers.update({
+        "Access-Control-Allow-Origin":  SITE_ORIGIN,
+        "Access-Control-Allow-Headers": "Content-Type, X-Api-Secret",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    })
+    return resp
+
+async def start_api():
+    app = web.Application(middlewares=[cors])
+    app.add_routes([
+        web.post  ("/api/admin/keys",   api_gen),
+        web.get   ("/api/admin/keys",   api_list),
+        web.post  ("/api/admin/revoke", api_revoke),
+        web.route ("OPTIONS", "/{tail:.*}", lambda r: web.Response()),
+    ])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", API_PORT).start()
+    print(f"[FemWare] admin API running on :{API_PORT}")
+
+# ── bot ───────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-PANEL_CHANNEL = "get-script"   # channel name — change if different
+class FemBot(commands.Bot):
+    async def setup_hook(self):
+        self.add_view(FemWarePanel())   # persistent view survives restarts
+        await start_api()
+
+bot = FemBot(command_prefix="!", intents=intents)
+_panel_sent = False
 
 @bot.event
 async def on_ready():
-    bot.add_view(FemWarePanel())
-    await bot.tree.sync()
+    global _panel_sent
     print(f"[FemWare] online as {bot.user}")
-
+    if _panel_sent: return          # не спамить при реконнекте
+    _panel_sent = True
     for guild in bot.guilds:
         ch = discord.utils.get(guild.text_channels, name=PANEL_CHANNEL)
         if not ch:
-            print(f"[FemWare] #{PANEL_CHANNEL} not found in {guild.name}, skipping")
+            print(f"[FemWare] #{PANEL_CHANNEL} not found in {guild.name}")
             continue
-
-        # delete old bot messages in that channel so there's only one panel
         async for msg in ch.history(limit=50):
-            if msg.author == bot.user:
-                await msg.delete()
-
-        embed = discord.Embed(
-            title="FemWare",
-            description=(
-                "**The best script for Project Delta.**\n"
-                "Dominate every match — powerful, stable, undetected.\n\n"
-                "🔑 **Redeem Key** — enter your key and receive the script\n"
-                "🛒 **Get Key** — visit the shop to purchase ($3 lifetime)\n"
-                "🔄 **Reset HWID** — reset your hardware ID (7d cooldown)\n"
-                "👤 **Get Role** — claim your @Buyer role after redeeming"
-            ),
-            color=C_ACCENT
-        )
-        embed.set_footer(text="FemWare • femware.vercel.app")
-        await ch.send(embed=embed, view=FemWarePanel())
+            if msg.author == bot.user: await msg.delete()
+        await ch.send(embed=panel_embed(), view=FemWarePanel())
         print(f"[FemWare] panel sent to #{PANEL_CHANNEL} in {guild.name}")
 
-# ── /panel ───────────────────────────────────────────────────────────────
-@bot.tree.command(name="panel", description="Send the FemWare button panel")
-async def panel(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="<:femware:0> FemWare",
-        description=(
-            "**The best script for Project Delta.**\n"
-            "Dominate every match — powerful, stable, undetected.\n\n"
-            "🔑 **Redeem Key** — enter your key and receive the script\n"
-            "🛒 **Get Key** — visit the shop to purchase ($3 lifetime)\n"
-            "🔄 **Reset HWID** — reset your hardware ID (7d cooldown)\n"
-            "👤 **Get Role** — claim your @Buyer role after redeeming"
-        ),
-        color=C_ACCENT
-    )
-    embed.set_footer(text="FemWare • femware.vercel.app")
-    await interaction.response.send_message(embed=embed, view=FemWarePanel())
-
-# ── /addkey (admin) ──────────────────────────────────────────────────────
-@bot.tree.command(name="addkey", description="[Admin] Add a key manually")
-@app_commands.describe(key="XXXX-XXXX-XXXX-XXXX", duration="Lifetime / 30 days / etc")
-async def addkey(interaction: discord.Interaction, key: str, duration: str = "Lifetime"):
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-        return
-    key = key.strip().upper()
-    if not KEY_RE.match(key):
-        await interaction.response.send_message("❌ Invalid format.", ephemeral=True)
-        return
-    keys = load_keys()
-    if key in keys:
-        await interaction.response.send_message(f"❌ Key `{key}` already exists.", ephemeral=True)
-        return
-    keys[key] = {"status":"active","product":"FemWare — Script","duration":duration,"created":ts(),"used_by":None,"used_id":None,"used_at":None}
-    save_keys(keys)
-    await interaction.response.send_message(f"✅ Key `{key}` added ({duration}).", ephemeral=True)
-
-# ── /revokekey (admin) ───────────────────────────────────────────────────
-@bot.tree.command(name="revokekey", description="[Admin] Revoke a key")
-@app_commands.describe(key="Key to revoke")
-async def revokekey(interaction: discord.Interaction, key: str):
-    if interaction.user.id not in ADMIN_IDS:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-        return
-    keys = load_keys()
-    key = key.strip().upper()
-    if key not in keys:
-        await interaction.response.send_message("❌ Key not found.", ephemeral=True)
-        return
-    keys[key]["status"] = "revoked"
-    save_keys(keys)
-    await interaction.response.send_message(f"✅ Key `{key}` revoked.", ephemeral=True)
-  
-bot.run("MTU1ODk4NzAyNjQ1MDA5MjA0Mg.Gc4y-7.NhCqSF5Ec9xtUWYNJ1_McxRTm3tnFgQrjgE85E")
+bot.run(BOT_TOKEN)
