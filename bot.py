@@ -358,7 +358,6 @@ intents.members = True
 class FemBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(FemWarePanel())   # persistent view survives restarts
-        await self.tree.sync()
         await start_api()
 
 bot = FemBot(command_prefix="!", intents=intents)
