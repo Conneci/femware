@@ -445,8 +445,7 @@ async def cmd_listkeys(ctx):
     embed.add_field(name='🔴 Used',    value=str(len(used)),    inline=True)
     embed.add_field(name='⚫ Revoked', value=str(len(revoked)), inline=True)
     if active:
-        embed.add_field(name='Active keys', value='
-'.join(f'`{k}`' for k in active[:10]), inline=False)
+        embed.add_field(name='Active keys', value='\n'.join(f'`{k}`' for k in active[:10]), inline=False)
     await ctx.reply(embed=embed, delete_after=60)
 
 bot.run(BOT_TOKEN)
