@@ -346,5 +346,5 @@ async def revokekey(interaction: discord.Interaction, key: str):
     keys[key]["status"] = "revoked"
     save_keys(keys)
     await interaction.response.send_message(f"✅ Key `{key}` revoked.", ephemeral=True)
-import os
-bot.run(os.environ["BOT_TOKEN"])
+  
+bot.run("MTU1ODk4NzAyNjQ1MDA5MjA0Mg.GWXoOq.YZHSBAQ-6nnfqjck8fZ3H8UzSvNvy3q9uoCBLU")
