@@ -28,7 +28,7 @@ SITE_ORIGIN   = "https://conneci.github.io"      # FILL: твой домен с�
 SCRIPT_LINK   = "https://yourlink.com"           # FILL: ссылка на скрипт
 FUNPAY_LINK   = "https://funpay.com/"            # FILL: ссылка на лот FunPay
 BUYER_ROLE    = "Buyer"
-PANEL_CHANNEL = "get-keys"
+PANEL_CHANNEL = "get-script"
 KEYS_FILE     = "keys.json"
 HWID_FILE     = "hwids.json"
 # ─────────────────────────────────────────────────────────────────────────
@@ -358,6 +358,7 @@ intents.members = True
 class FemBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(FemWarePanel())   # persistent view survives restarts
+        await self.tree.sync()
         await start_api()
 
 bot = FemBot(command_prefix="!", intents=intents)
